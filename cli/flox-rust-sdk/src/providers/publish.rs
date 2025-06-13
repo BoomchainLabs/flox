@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
 
 use catalog_api_v1::types::{NarInfo, NarInfos, Output, Outputs, PublishResponse, SystemEnum};
 use chrono::{DateTime, Utc};
 use indoc::{formatdoc, indoc};
 use thiserror::Error;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 use url::Url;
 
 use super::auth::{AuthError, AuthProvider, CatalogAuth, NixCopyAuth};
@@ -58,7 +58,7 @@ pub enum PublishError {
     PackageTargetError(#[from] PackageTargetError),
 
     #[error(transparent)]
-    BuildError(#[from] ManifestBuilderError),
+    ManifestBuildError(#[from] ManifestBuilderError),
 
     #[error(transparent)]
     CatalogError(CatalogClientError),
@@ -69,6 +69,20 @@ pub enum PublishError {
         #[from]
         BaseCatalogUrlError,
     ),
+
+    #[error(
+        "build of package(s) failed ({status})\n\
+        stderr:\n\
+        {stderr}\n\
+        \n\
+        stdout:\n\
+        {stdout}"
+    )]
+    PackageBuildError {
+        status: ExitStatus,
+        stderr: String,
+        stdout: String,
+    },
 
     #[error("Could not identify user from authentication info")]
     Unauthenticated,
@@ -93,6 +107,9 @@ pub enum PublishError {
 
     #[error(transparent)]
     Auth(#[from] AuthError),
+
+    #[error("Timed out waiting for publish completion")]
+    PublishTimeout,
 }
 
 /// The `Publish` trait describes the high level behavior of publishing a package to a catalog.
@@ -106,6 +123,12 @@ pub trait Publisher {
         catalog_name: &str,
         key_file: Option<PathBuf>,
         metadata_only: bool,
+    ) -> Result<(), PublishError>;
+    async fn wait_for_publish_completion(
+        &self,
+        client: &Client,
+        poll_interval_millis: u64,
+        timeout_millis: u64,
     ) -> Result<(), PublishError>;
 }
 
@@ -323,7 +346,7 @@ impl ClientSideCatalogStoreConfig {
     ///
     /// Note: this is only public because it's used in the private `flox upload`
     ///       command.
-    #[instrument(skip_all, fields(progress = format!("Uploading '{store_path}' to '{}'", destination_url)))]
+    #[instrument(skip_all, fields(progress = format!("Uploading '{store_path}'")))]
     pub fn upload_store_path(
         destination_url: &Url,
         signing_key_path: Option<&Path>,
@@ -563,6 +586,53 @@ where
 
         Ok(())
     }
+
+    /// Waits until the narinfos for all store paths are present in the catalog,
+    /// or errors on timeout.
+    async fn wait_for_publish_completion(
+        &self,
+        client: &Client,
+        poll_interval_millis: u64,
+        timeout_millis: u64,
+    ) -> Result<(), PublishError> {
+        let store_paths = self
+            .build_metadata
+            .outputs
+            .0
+            .iter()
+            .map(|output| output.store_path.clone())
+            .collect::<Vec<_>>();
+        let loop_poll_and_wait = async {
+            let start = tokio::time::Instant::now();
+            let wait_duration = tokio::time::Duration::from_millis(poll_interval_millis);
+            loop {
+                let now = tokio::time::Instant::now();
+                let elapsed = now.duration_since(start);
+                debug!(
+                    elapsed_millis = elapsed.as_millis(),
+                    "polling publish completion"
+                );
+                if client
+                    .is_publish_complete(&store_paths)
+                    .await
+                    .map_err(PublishError::CatalogError)?
+                {
+                    break;
+                }
+                debug!("not complete, sleeping");
+                tokio::time::sleep(wait_duration).await;
+            }
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(start);
+            debug!(elapsed_millis = elapsed.as_millis(), "publish complete");
+            Ok::<_, PublishError>(())
+        };
+        let timeout = tokio::time::Duration::from_millis(timeout_millis);
+        tokio::time::timeout(timeout, loop_poll_and_wait)
+            .await
+            .map_err(|_| PublishError::PublishTimeout)??;
+        Ok(())
+    }
 }
 
 /// Get the complete configuration for client-side interactions with the provided
@@ -663,7 +733,8 @@ pub fn check_build_metadata(
     pkg: &PackageTarget,
 ) -> Result<CheckedBuildMetadata, PublishError> {
     // git clone into a temp directory
-    let clean_repo_path = tempfile::tempdir_in(flox.temp_dir.clone()).unwrap();
+    let clean_repo_path = tempfile::tempdir_in(flox.temp_dir.clone())
+        .map_err(|err| PublishError::Catchall(format!("could not create tempdir: {err}")))?;
     let git = <GitCommandProvider as GitProvider>::clone(
         env_metadata.repo_root_path.as_path(),
         &clean_repo_path,
@@ -711,19 +782,30 @@ pub fn check_build_metadata(
     )?;
 
     let mut output_build_results: Option<BuildResults> = None;
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
     for message in output_stream {
         match message {
             build::Output::Success(build_results) => {
                 output_build_results = Some(build_results);
             },
-            build::Output::Failure(_) => {
-                panic!("expected build to succeed");
+            build::Output::Failure(status) => {
+                return Err(PublishError::PackageBuildError {
+                    status,
+                    stderr,
+                    stdout,
+                });
             },
             build::Output::Stdout(line) => {
-                println!("{line}");
+                info!("{line}");
+                stdout.push_str(&line);
+                stdout.push('\n');
             },
             build::Output::Stderr(line) => {
-                eprintln!("{line}");
+                stderr.push_str(&line);
+                stderr.push('\n');
+                info!("{line}");
             },
         }
     }

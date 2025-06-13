@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -120,8 +120,9 @@ pub struct BuildResult {
     pub version: String,
     pub system: Option<String>,
     pub log: BuiltStorePath,
-    #[serde(rename = "outLink")]
-    pub out_link: PathBuf,
+    // TODO: factor out and use buildenv::BuiltStorePath (?)
+    #[serde(rename = "resultLinks")]
+    pub result_links: BTreeMap<PathBuf, PathBuf>,
 }
 
 /// Output received from an ongoing build process.
@@ -994,8 +995,6 @@ mod tests {
         // expect the build to succeed
         let output = assert_build_status(&flox, &mut env, &pname, None, true);
 
-        // [sic] newline before 'HINT: ...' ignored in 'nix build -L' output:
-        // <https://github.com/NixOS/nix/issues/11991>
         let expected_output = formatdoc! {r#"
             {pname}> ⚠️  WARNING: $out/bin/not-executable is not executable.
             {pname}> ⚠️  WARNING: $out/bin/subdir is not a file.
@@ -1006,14 +1005,22 @@ mod tests {
             {pname}>   - copy a bin directory with 'mkdir $out && cp -r bin $out'
             {pname}>   - copy multiple files with 'mkdir -p $out/bin && cp bin/* $out/bin'
             {pname}>   - copy files from an Autotools project with 'make install PREFIX=$out'
+            {pname}>{}
             {pname}> HINT: The following executables were found outside of '$out/bin':
             {pname}>   - not-bin/hello
             {pname}>   - bin/subdir/executable-in-subdir
-        "#};
-        assert!(
-            output.stderr.contains(&expected_output),
-            "{expected_output}"
-        );
+        "#,
+        // Nix logs always include one space of padding even on empty lines.
+        // Add a trailing space like this so auto-formatters don't trim trailing
+        // whitespace
+        " "};
+        if !output.stderr.contains(&expected_output) {
+            pretty_assertions::assert_eq!(
+                output.stderr,
+                expected_output,
+                "didn't find expected output, diffing entire output"
+            );
+        }
     }
 
     #[test]
@@ -1537,14 +1544,14 @@ mod tests {
 
     #[test]
     fn build_depending_on_another_build() {
-        let package_name = String::from("foo");
-        let file_name = String::from("bar");
+        let package_name = String::from("app-with-dashes");
+        let file_name = String::from("foo");
         let file_content = String::from("some content");
 
         let manifest = formatdoc! {r#"
             version = 1
 
-            [build.dep]
+            [build.dep-with-dashes]
             command = """
                 mkdir $out
                 echo -n "{file_content}" > $out/{file_name}
@@ -1553,7 +1560,7 @@ mod tests {
             [build.{package_name}]
             command = """
                 mkdir $out
-                cp ${{dep}}/{file_name} $out/{file_name}
+                cp ${{dep-with-dashes}}/{file_name} $out/{file_name}
             """
         "#};
 

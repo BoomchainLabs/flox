@@ -44,7 +44,7 @@ pub static GENERATED_DATA: LazyLock<PathBuf> =
 pub static MANUALLY_GENERATED: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(std::env::var("MANUALLY_GENERATED").unwrap()));
 
-const RESPONSE_PAGE_SIZE: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(1000) };
+const RESPONSE_PAGE_SIZE: NonZeroU32 = NonZeroU32::new(1000).unwrap();
 
 type ResolvedGroups = Vec<ResolvedPackageGroup>;
 
@@ -82,6 +82,7 @@ pub enum Response {
     Packages(PackageDetails),
     Search(SearchResults),
     GetStoreInfo(StoreInfoResponse),
+    GetStorepathStatus(StorepathStatusResponse),
     Error(GenericResponse<ErrorResponse>),
     Publish(PublishResponse),
     CreatePackage,
@@ -322,6 +323,7 @@ impl CatalogClient {
             let conn_timeout = std::time::Duration::from_secs(15);
             let req_timeout = std::time::Duration::from_secs(60);
             reqwest::ClientBuilder::new()
+                .connection_verbose(true)
                 .connect_timeout(conn_timeout)
                 .timeout(req_timeout)
                 .user_agent(format!("flox-cli/{}", &*FLOX_VERSION))
@@ -405,6 +407,7 @@ pub type UserBuildPublish = api_types::UserBuildPublish;
 pub type UserDerivationInfo = api_types::UserDerivationInput;
 pub type StoreInfoRequest = api_types::StoreInfoRequest;
 pub type StoreInfoResponse = api_types::StoreInfoResponse;
+pub type StorepathStatusResponse = api_types::StorepathStatusResponse;
 pub type StoreInfo = api_types::StoreInfo;
 pub type CatalogStoreConfig = api_types::CatalogStoreConfig;
 pub type CatalogStoreConfigNixCopy = api_types::CatalogStoreConfigNixCopy;
@@ -473,6 +476,10 @@ pub trait ClientTrait {
         &self,
         _derivations: Vec<String>,
     ) -> Result<HashMap<String, Vec<StoreInfo>>, CatalogClientError>;
+
+    /// Checks whether the provided package has been successfully published.
+    async fn is_publish_complete(&self, store_paths: &[String])
+    -> Result<bool, CatalogClientError>;
 }
 
 impl ClientTrait for CatalogClient {
@@ -491,9 +498,12 @@ impl ClientTrait for CatalogClient {
                 .collect::<Result<Vec<_>, _>>()?,
         };
 
+        // TODO: once we decide how to handle the candidate pages we get back
+        //       from catalog-server, we can change this `None` to the number
+        //       of candidate pages we *want*.
         let response = self
             .client
-            .resolve_api_v1_catalog_resolve_post(&package_groups)
+            .resolve_api_v1_catalog_resolve_post(None, &package_groups)
             .await
             .map_err(CatalogClientError::APIError)?;
 
@@ -725,6 +735,38 @@ impl ClientTrait for CatalogClient {
             })?;
         let store_info = response.into_inner();
         Ok(store_info.items)
+    }
+
+    /// Checks whether the store paths for a package have made it into the catalog store yet.
+    async fn is_publish_complete(
+        &self,
+        store_paths: &[String],
+    ) -> Result<bool, CatalogClientError> {
+        let req = StoreInfoRequest {
+            drv_paths: None,
+            outpaths: store_paths.to_vec(),
+        };
+        let statuses = self
+            .client
+            .get_storepath_status_api_v1_catalog_store_status_post(&req)
+            .await
+            .map_err(|e| match e {
+                APIError::ErrorResponse(err) => {
+                    CatalogClientError::APIError(APIError::ErrorResponse(err))
+                },
+                _ => CatalogClientError::APIError(e),
+            })?;
+        // TODO(zmitchell): We currently throw away _progress_ because the status is reported
+        //                  by store path, and what we're reporting here is all or nothing.
+        //                  In the future we can provide more detail using the statuses here,
+        //                  which could be used to indicate to the user that *something* is
+        //                  happening.
+        let all_narinfo_available = statuses.items.values().all(|storepath_statuses_for_drv| {
+            storepath_statuses_for_drv
+                .iter()
+                .all(|status| status.narinfo_known)
+        });
+        Ok(all_narinfo_available)
     }
 }
 
@@ -1001,6 +1043,27 @@ impl ClientTrait for MockClient {
             Some(Response::GetStoreInfo(resp)) => Ok(resp.items),
             _ => panic!("expected get_store_info response, found {:?}", &mock_resp),
         }
+    }
+
+    async fn is_publish_complete(
+        &self,
+        _store_paths: &[String],
+    ) -> Result<bool, CatalogClientError> {
+        let mock_resp = self
+            .mock_responses
+            .lock()
+            .expect("couldn't acquire mock lock")
+            .pop_front();
+        let statuses = match mock_resp {
+            Some(Response::GetStorepathStatus(resp)) => resp,
+            _ => panic!("expected get_store_info response, found {:?}", &mock_resp),
+        };
+        let all_narinfo_available = statuses.items.values().all(|storepath_statuses_for_drv| {
+            storepath_statuses_for_drv
+                .iter()
+                .all(|status| status.narinfo_known)
+        });
+        Ok(all_narinfo_available)
     }
 }
 
@@ -1483,9 +1546,7 @@ impl Display for BaseCatalogUrl {
 /// Outisde of tests this should be replaced by a mechanism that fetches an actual locked URL,
 /// in correspondence with the catalog server.
 pub fn mock_base_catalog_url() -> BaseCatalogUrl {
-    BaseCatalogUrl::from(
-        "https://github.com/flox/nixpkgs?rev=698214a32beb4f4c8e3942372c694f40848b360d",
-    )
+    BaseCatalogUrl::from(env!("TESTING_BASE_CATALOG_URL"))
 }
 
 pub mod test_helpers {

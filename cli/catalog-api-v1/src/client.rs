@@ -2054,7 +2054,8 @@ pub mod types {
     ///      "type": [
     ///        "object",
     ///        "null"
-    ///      ]
+    ///      ],
+    ///      "additionalProperties": true
     ///    },
     ///    "ingress_uri": {
     ///      "title": "Ingress Uri",
@@ -2383,6 +2384,16 @@ pub mod types {
     ///    "name"
     ///  ],
     ///  "properties": {
+    ///    "candidate_pages": {
+    ///      "title": "Candidate Pages",
+    ///      "type": [
+    ///        "array",
+    ///        "null"
+    ///      ],
+    ///      "items": {
+    ///        "$ref": "#/components/schemas/CatalogPage"
+    ///      }
+    ///    },
     ///    "messages": {
     ///      "title": "Messages",
     ///      "type": "array",
@@ -2403,6 +2414,8 @@ pub mod types {
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
     pub struct ResolvedPackageGroup {
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub candidate_pages: ::std::option::Option<::std::vec::Vec<CatalogPage>>,
         pub messages: ::std::vec::Vec<ResolutionMessageGeneral>,
         pub name: ::std::string::String,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -2596,7 +2609,8 @@ pub mod types {
     ///      "type": [
     ///        "object",
     ///        "null"
-    ///      ]
+    ///      ],
+    ///      "additionalProperties": true
     ///    },
     ///    "catalog": {
     ///      "title": "Catalog",
@@ -2729,6 +2743,85 @@ pub mod types {
     }
     impl ::std::convert::From<&StoreInfoResponse> for StoreInfoResponse {
         fn from(value: &StoreInfoResponse) -> Self {
+            value.clone()
+        }
+    }
+    ///`StorepathStatus`
+    ///
+    /// <details><summary>JSON schema</summary>
+    ///
+    /// ```json
+    ///{
+    ///  "title": "StorepathStatus",
+    ///  "type": "object",
+    ///  "required": [
+    ///    "catalog",
+    ///    "narinfo_known",
+    ///    "package"
+    ///  ],
+    ///  "properties": {
+    ///    "catalog": {
+    ///      "title": "Catalog",
+    ///      "type": "string"
+    ///    },
+    ///    "narinfo_known": {
+    ///      "title": "Narinfo Known",
+    ///      "type": "boolean"
+    ///    },
+    ///    "package": {
+    ///      "title": "Package",
+    ///      "type": "string"
+    ///    }
+    ///  }
+    ///}
+    /// ```
+    /// </details>
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
+    pub struct StorepathStatus {
+        pub catalog: ::std::string::String,
+        pub narinfo_known: bool,
+        pub package: ::std::string::String,
+    }
+    impl ::std::convert::From<&StorepathStatus> for StorepathStatus {
+        fn from(value: &StorepathStatus) -> Self {
+            value.clone()
+        }
+    }
+    ///`StorepathStatusResponse`
+    ///
+    /// <details><summary>JSON schema</summary>
+    ///
+    /// ```json
+    ///{
+    ///  "title": "StorepathStatusResponse",
+    ///  "type": "object",
+    ///  "required": [
+    ///    "items"
+    ///  ],
+    ///  "properties": {
+    ///    "items": {
+    ///      "title": "Items",
+    ///      "type": "object",
+    ///      "additionalProperties": {
+    ///        "type": "array",
+    ///        "items": {
+    ///          "$ref": "#/components/schemas/StorepathStatus"
+    ///        }
+    ///      }
+    ///    }
+    ///  }
+    ///}
+    /// ```
+    /// </details>
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, PartialEq)]
+    pub struct StorepathStatusResponse {
+        pub items: ::std::collections::HashMap<
+            ::std::string::String,
+            ::std::vec::Vec<StorepathStatus>,
+        >,
+    }
+    impl ::std::convert::From<&StorepathStatusResponse> for StorepathStatusResponse {
+        fn from(value: &StorepathStatusResponse) -> Self {
             value.clone()
         }
     }
@@ -4619,6 +4712,7 @@ Sends a `POST` request to `/api/v1/catalog/resolve`
 */
     pub async fn resolve_api_v1_catalog_resolve_post<'a>(
         &'a self,
+        candidate_pages: Option<i64>,
         body: &'a types::PackageGroups,
     ) -> Result<
         ResponseValue<types::ResolvedPackageGroups>,
@@ -4640,6 +4734,9 @@ Sends a `POST` request to `/api/v1/catalog/resolve`
                 ::reqwest::header::HeaderValue::from_static("application/json"),
             )
             .json(&body)
+            .query(
+                &progenitor_client::QueryParam::new("candidate_pages", &candidate_pages),
+            )
             .headers(header_map)
             .build()?;
         let result = self.client.execute(request).await;
@@ -4930,6 +5027,54 @@ Sends a `POST` request to `/api/v1/catalog/store`
         body: &'a types::StoreInfoRequest,
     ) -> Result<ResponseValue<types::StoreInfoResponse>, Error<types::ErrorResponse>> {
         let url = format!("{}/api/v1/catalog/store", self.baseurl,);
+        let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+        header_map
+            .append(
+                ::reqwest::header::HeaderName::from_static("api-version"),
+                ::reqwest::header::HeaderValue::from_static(self.api_version()),
+            );
+        #[allow(unused_mut)]
+        let mut request = self
+            .client
+            .post(url)
+            .header(
+                ::reqwest::header::ACCEPT,
+                ::reqwest::header::HeaderValue::from_static("application/json"),
+            )
+            .json(&body)
+            .headers(header_map)
+            .build()?;
+        let result = self.client.execute(request).await;
+        let response = result?;
+        match response.status().as_u16() {
+            200u16 => ResponseValue::from_response(response).await,
+            422u16 => {
+                Err(Error::ErrorResponse(ResponseValue::from_response(response).await?))
+            }
+            _ => Err(Error::UnexpectedResponse(response)),
+        }
+    }
+    /**Get status for a list of storepaths
+
+Get status for a list of storepaths
+
+Body Parameters:
+- **StoreInfoRequest**: A list of derivation paths
+
+Returns:
+- **StoreInfoResponse**: a map of derivation path to a list of store info objects
+
+Sends a `POST` request to `/api/v1/catalog/store/status`
+
+*/
+    pub async fn get_storepath_status_api_v1_catalog_store_status_post<'a>(
+        &'a self,
+        body: &'a types::StoreInfoRequest,
+    ) -> Result<
+        ResponseValue<types::StorepathStatusResponse>,
+        Error<types::ErrorResponse>,
+    > {
+        let url = format!("{}/api/v1/catalog/store/status", self.baseurl,);
         let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
         header_map
             .append(
